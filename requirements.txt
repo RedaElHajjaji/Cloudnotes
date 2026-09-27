@@ -1,0 +1,9 @@
+# CloudNotes dependencies.
+#
+# Single source of truth for runtime and development dependencies is
+# pyproject.toml ([project] and [project.optional-dependencies]).
+# This file exists for tooling that expects a requirements.txt
+# (CI, hosting platforms, `pip install -r requirements.txt`).
+#
+# Runtime + dev tooling (ruff, pytest, httpx for TestClient):
+-e .[dev]

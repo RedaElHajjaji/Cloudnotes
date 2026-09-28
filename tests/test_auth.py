@@ -2,20 +2,18 @@
 
 These tests run the real application against the real migrated database so
 the full path is exercised: routing → schemas → service → repository →
-PostgreSQL. The ``get_db`` dependency is overridden to bind sessions to the
-test engine. Skipped unless ``CLOUDNOTES_TEST_DATABASE_URL`` is set.
+PostgreSQL. The ``client`` fixture (see ``tests/conftest.py``) overrides
+``get_db`` to bind request sessions to the test engine. Skipped unless
+``CLOUDNOTES_TEST_DATABASE_URL`` is set.
 """
 
 import uuid
-from collections.abc import AsyncGenerator, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.db.session import get_db
-from app.main import create_app
 from app.models.user import User
 
 pytestmark = [pytest.mark.auth, pytest.mark.db]
@@ -23,29 +21,6 @@ pytestmark = [pytest.mark.auth, pytest.mark.db]
 
 def _unique_email() -> str:
     return f"user-{uuid.uuid4().hex[:12]}@example.com"
-
-
-@pytest.fixture
-def client(migrated_engine: AsyncEngine) -> Iterator[TestClient]:
-    """Test client whose requests use sessions on the migrated test database."""
-    factory = async_sessionmaker(bind=migrated_engine, expire_on_commit=False)
-
-    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
-        async with factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-
-    app = create_app()
-    app.dependency_overrides[get_db] = override_get_db
-    try:
-        with TestClient(app) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.clear()
 
 
 def test_register_creates_user_with_hashed_password(client: TestClient) -> None:

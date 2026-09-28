@@ -5,9 +5,12 @@ from app.services.auth import (
     EmailAlreadyRegisteredError,
     InvalidCredentialsError,
 )
+from app.services.note import NoteNotFoundError, NoteService
 
 __all__ = [
     "AuthService",
     "EmailAlreadyRegisteredError",
     "InvalidCredentialsError",
+    "NoteNotFoundError",
+    "NoteService",
 ]

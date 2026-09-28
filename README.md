@@ -34,10 +34,11 @@ cloudnotes/
 │   │   └── v1/
 │   │       └── health.py    # GET /health
 │   ├── api/
-│   │   ├── deps.py          # get_db, get_auth_service, get_current_user (Bearer JWT)
+│   │   ├── deps.py          # get_db, service factories, get_current_user (Bearer JWT)
 │   │   └── v1/
 │   │       ├── auth.py      # register / login / me
 │   │       ├── health.py    # GET /health
+│   │       ├── notes.py     # notes CRUD (auth required)
 │   │       └── ready.py     # GET /ready
 │   ├── core/
 │   │   ├── config.py        # Pydantic Settings (CLOUDNOTES_ env prefix)
@@ -48,13 +49,17 @@ cloudnotes/
 │   │   ├── session.py       # async engine, sessionmaker, get_db dependency
 │   │   └── health.py        # SELECT 1 connectivity probe
 │   ├── models/
+│   │   ├── note.py          # Note ORM model (notes table, User 1:N Note)
 │   │   └── user.py          # User ORM model (users table)
 │   ├── schemas/             # Pydantic request/response schemas
+│   │   ├── note.py          # NoteCreate, NoteUpdate, NoteRead, NotePage
 │   │   ├── user.py          # RegisterRequest, LoginRequest, TokenResponse, UserRead
 │   │   └── health.py        # ReadyResponse
 │   ├── services/
-│   │   └── auth.py          # AuthService: register / authenticate / issue token
+│   │   ├── auth.py          # AuthService: register / authenticate / issue token
+│   │   └── note.py          # NoteService: owner-scoped CRUD
 │   └── repositories/
+│       ├── note.py          # NoteRepository (owner-scoped queries)
 │       └── user.py          # UserRepository
 ├── docs/
 │   └── database.md          # database architecture & migrations guide
@@ -67,6 +72,7 @@ cloudnotes/
 │   ├── test_ready.py        # /ready unit tests (fake engine)
 │   ├── test_security.py     # hashing / JWT / password-policy unit tests
 │   ├── test_auth.py         # auth API tests (real PostgreSQL, gated)
+│   ├── test_notes.py        # notes CRUD API tests (real PostgreSQL, gated)
 │   └── test_db.py           # DB integration tests (real PostgreSQL, gated)
 ├── .env.example             # template for local environment variables
 ├── .gitignore
@@ -200,6 +206,52 @@ async def list_notes(current_user: CurrentUser) -> dict[str, str]:
 
 HS256-signed JWTs with `sub` (user id), `iat`, `exp`, `iss`, and a unique `jti`. All parameters are environment-configured (see table above). The app refuses to start without `CLOUDNOTES_JWT_SECRET` — there is deliberately no insecure default.
 
+## Notes API
+
+All note endpoints require a Bearer token and are **strictly owner-scoped**: a note belonging to another user is indistinguishable from a nonexistent one (`404`, never `403`) so note ids cannot be enumerated across users.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/notes` | Create a note (`201`). Title required (1–200 chars); content optional (≤100 000 chars) |
+| `GET` | `/api/v1/notes` | List your notes, newest first. `?limit` (1–100, default 20) and `?offset` for pagination |
+| `GET` | `/api/v1/notes/{id}` | Retrieve one of your notes (`404` if missing or foreign) |
+| `PUT` | `/api/v1/notes/{id}` | Update (partial allowed — omitted fields unchanged) |
+| `DELETE` | `/api/v1/notes/{id}` | Delete (`204`, empty body) |
+
+### Example requests
+
+```bash
+TOKEN="<access_token from /auth/login>"
+
+# Create
+curl -X POST http://127.0.0.1:8000/api/v1/notes \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title": "Groceries", "content": "Milk, eggs, coffee"}'
+# 201 {"id": "...", "user_id": "...", "title": "Groceries", "content": "...", ...}
+
+# List (paginated)
+curl "http://127.0.0.1:8000/api/v1/notes?limit=10&offset=0" \
+  -H "Authorization: Bearer $TOKEN"
+# 200 {"items": [...], "total": 1, "limit": 10, "offset": 0}
+
+# Retrieve one
+curl http://127.0.0.1:8000/api/v1/notes/<note_id> -H "Authorization: Bearer $TOKEN"
+
+# Update (partial)
+curl -X PUT http://127.0.0.1:8000/api/v1/notes/<note_id> \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title": "Groceries (week 42)"}'
+
+# Delete
+curl -X DELETE http://127.0.0.1:8000/api/v1/notes/<note_id> -H "Authorization: Bearer $TOKEN"
+# 204 No Content
+```
+
+### Ownership model
+
+- Every notes table query is scoped by `user_id` **inside the repository**, so ownership cannot be bypassed by a future call site.
+- `notes.user_id` is a foreign key to `users(id)` with `ON DELETE CASCADE`; deleting a user removes their notes at the database level. The ORM mirrors this with `cascade="all, delete-orphan"` + `passive_deletes=True` (safe under `AsyncSession`).
+
 ## Database
 
 PostgreSQL with async SQLAlchemy 2.x and Alembic migrations — see **[docs/database.md](docs/database.md)** for the full guide (engine/session architecture, model conventions, migration workflow, readiness semantics, and test setup).
@@ -229,6 +281,8 @@ The suite covers:
 - Security primitives: Argon2id roundtrip, wrong-password and malformed-hash rejection, salt uniqueness, JWT claims, garbage/wrong-key/expired tokens, password policy
 
 Authentication API tests (`tests/test_auth.py`, marked `auth`) run the full stack against real PostgreSQL: registration, duplicate registration (409), weak password / invalid email (422), login, wrong password and unknown email (401 with identical bodies), missing/invalid/expired tokens on `/me` (401), successful `/me`, and verification that only Argon2id hashes are stored.
+
+Notes API tests (`tests/test_notes.py`) cover create / retrieve / list / update / delete, nonexistent and malformed ids, missing and invalid tokens, full cross-user isolation (foreign read/update/delete → 404, isolated listings), validation errors, pagination ordering, and the user→notes cascade delete.
 
 Database integration tests (`tests/test_db.py`, marked `db`) run against real PostgreSQL and are **skipped unless `CLOUDNOTES_TEST_DATABASE_URL` is set**:
 
@@ -265,7 +319,7 @@ ruff format .         # auto-format
 
 - [x] PostgreSQL + SQLAlchemy 2.x async engine/sessions
 - [x] Alembic migrations
-- [ ] Notes & tags CRUD under `/api/v1`
+- [x] Notes CRUD under `/api/v1` (tags in a later step)
 - [x] Authentication (JWT + Argon2id; authorization/roles in a later step)
 - [ ] Docker & Docker Compose
 - [ ] GitHub Actions CI (lint + tests)

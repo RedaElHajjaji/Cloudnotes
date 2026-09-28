@@ -12,8 +12,9 @@ from app.db.session import get_db
 from app.models.user import User
 from app.repositories.user import UserRepository
 from app.services.auth import AuthService
+from app.services.note import NoteService
 
-__all__ = ["get_auth_service", "get_current_user", "get_db"]
+__all__ = ["get_auth_service", "get_current_user", "get_db", "get_note_service"]
 
 # Bearer scheme configured to return 403-style auto-challenges disabled:
 # we handle errors ourselves so invalid/missing tokens produce clean 401s.
@@ -28,6 +29,16 @@ async def get_auth_service(
 
 
 AuthServiceDependency = Annotated[AuthService, Depends(get_auth_service)]
+
+
+async def get_note_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AsyncGenerator[NoteService, None]:
+    """Provide a :class:`NoteService` bound to the request's session."""
+    yield NoteService(db)
+
+
+NoteServiceDependency = Annotated[NoteService, Depends(get_note_service)]
 
 
 async def get_current_user(

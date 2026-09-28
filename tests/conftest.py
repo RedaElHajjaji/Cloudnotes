@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import uuid
 from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
+from app.db.session import get_db
 from app.main import create_app
 
 TEST_DATABASE_URL_ENV = "CLOUDNOTES_TEST_DATABASE_URL"
@@ -94,7 +96,62 @@ async def db_session(migrated_engine: AsyncEngine) -> AsyncGenerator[AsyncSessio
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    """Yield an HTTP test client bound to a fresh application instance."""
-    with TestClient(create_app()) as test_client:
-        yield test_client
+def client(migrated_engine: AsyncEngine) -> Iterator[TestClient]:
+    """Test client whose requests use sessions on the migrated test database.
+
+    The ``get_db`` dependency is overridden so the full request path
+    (including the transaction-per-request commit) runs against the test
+    engine.
+    """
+    factory = async_sessionmaker(bind=migrated_engine, expire_on_commit=False)
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    app = create_app()
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _new_credentials() -> tuple[str, str]:
+    """Unique (email, password) credentials for one test user."""
+    return f"user-{uuid.uuid4().hex[:12]}@example.com", "Sup3r-Secret"
+
+
+@pytest.fixture
+def registered_user(client: TestClient) -> tuple[str, str]:
+    """A user registered through the real API: returns (email, password)."""
+    email, password = _new_credentials()
+    response = client.post("/api/v1/auth/register", json={"email": email, "password": password})
+    assert response.status_code == 201, response.text
+    return email, password
+
+
+@pytest.fixture
+def auth_headers(client: TestClient, registered_user: tuple[str, str]) -> dict[str, str]:
+    """Bearer auth headers for the primary registered user."""
+    email, password = registered_user
+    response = client.post("/api/v1/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+@pytest.fixture
+def other_auth_headers(client: TestClient) -> dict[str, str]:
+    """Bearer auth headers for a second, independent user (cross-user tests)."""
+    email, password = _new_credentials()
+    register = client.post("/api/v1/auth/register", json={"email": email, "password": password})
+    assert register.status_code == 201, register.text
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": password})
+    assert login.status_code == 200, login.text
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}

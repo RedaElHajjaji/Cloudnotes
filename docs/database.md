@@ -53,7 +53,7 @@ The dependency always closes the session, even when a handler raises. **Transact
 
 All models inherit `app/db/base.py:Base`, whose metadata carries deterministic naming conventions (`pk_users`, `ix_users_email`, `fk_…`) so Alembic emits stable, predictable DDL. `TimestampMixin` adds `created_at` / `updated_at` (`timestamptz`, server-side `now()` defaults, `updated_at` also updates on modification).
 
-The initial model is `User` (`users` table):
+The `users` table:
 
 | Column | Type | Constraints |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ The initial model is `User` (`users` table):
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL`, server default `now()` |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL`, server default `now()`, onupdate |
 
-Registration/login endpoints are intentionally **not** implemented yet.
+The `notes` table: `id` (UUID PK), `user_id` (FK → `users.id`, `ON DELETE CASCADE`, indexed), `title` (`VARCHAR(200)`), `content` (`TEXT`), and the shared timestamps. The ORM relationship is `User.notes` ↔ `Note.owner` with `cascade="all, delete-orphan"` and `passive_deletes=True` so deletes are performed by the database and stay safe under `AsyncSession`.
 
 ## Migrations
 

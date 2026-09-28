@@ -12,12 +12,15 @@ CloudNotes provides a clean, layered FastAPI backend for managing notes and tags
 | Web framework | FastAPI (async) |
 | Validation | Pydantic v2 |
 | Configuration | pydantic-settings |
+| Database | PostgreSQL 16+ |
+| ORM | SQLAlchemy 2.x (async, asyncpg driver) |
+| Migrations | Alembic (async environment) |
 | Logging | Python `logging` (stdlib) |
-| Testing | pytest + `fastapi.testclient` (httpx) |
+| Testing | pytest + pytest-asyncio + `fastapi.testclient` (httpx) |
 | Linting / formatting | Ruff (lint + format) |
 | Server | uvicorn |
 
-Planned for later steps (not implemented yet): PostgreSQL, SQLAlchemy 2.x, Alembic migrations, authentication, notes/tags endpoints, Docker, GitHub Actions CI.
+Planned for later steps (not implemented yet): authentication, notes/tags endpoints, Docker, GitHub Actions CI.
 
 ## Project layout
 
@@ -32,14 +35,25 @@ cloudnotes/
 │   ├── core/
 │   │   ├── config.py        # Pydantic Settings (CLOUDNOTES_ env prefix)
 │   │   └── logging.py       # stdlib logging configuration
-│   ├── db/                  # engine/session (future step)
-│   ├── models/              # SQLAlchemy models (future step)
+│   ├── db/
+│   │   ├── base.py          # DeclarativeBase, naming conventions, TimestampMixin
+│   │   ├── session.py       # async engine, sessionmaker, get_db dependency
+│   │   └── health.py        # SELECT 1 connectivity probe
+│   ├── models/
+│   │   └── user.py          # User ORM model (users table)
 │   ├── schemas/             # Pydantic request/response schemas (future step)
 │   ├── services/            # business logic (future step)
 │   └── repositories/        # data access (future step)
+├── docs/
+│   └── database.md          # database architecture & migrations guide
+├── migrations/
+│   ├── env.py               # async Alembic environment
+│   └── versions/            # generated migration scripts
 ├── tests/
-│   ├── conftest.py          # shared fixtures (TestClient)
-│   └── test_health.py       # /health + OpenAPI docs tests
+│   ├── conftest.py          # fixtures (TestClient, migrated DB engine, sessions)
+│   ├── test_health.py       # /health + OpenAPI docs tests
+│   ├── test_ready.py        # /ready unit tests (fake engine)
+│   └── test_db.py           # DB integration tests (real PostgreSQL, gated)
 ├── .env.example             # template for local environment variables
 ├── .gitignore
 ├── pyproject.toml           # metadata, Ruff config, pytest config
@@ -78,8 +92,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 - Base URL: `http://127.0.0.1:8000`
-- Health check: `GET http://127.0.0.1:8000/health`
+- Health check (liveness): `GET http://127.0.0.1:8000/health`
 - Versioned health check: `GET http://127.0.0.1:8000/api/v1/health`
+- Readiness (verifies PostgreSQL): `GET http://127.0.0.1:8000/ready` and `GET http://127.0.0.1:8000/api/v1/ready`
 
 ## API documentation
 
@@ -99,6 +114,22 @@ All settings are loaded by Pydantic Settings (`app/core/config.py`) from environ
 | `CLOUDNOTES_DEBUG` | `false` | FastAPI debug mode |
 | `CLOUDNOTES_LOG_LEVEL` | `INFO` | Root logging level |
 | `CLOUDNOTES_APP_NAME` | `CloudNotes` | Name shown in OpenAPI docs |
+| `CLOUDNOTES_DATABASE_URL` | `postgresql+asyncpg://cloudnotes:cloudnotes@localhost:5432/cloudnotes` | Async PostgreSQL URL (app + Alembic) |
+| `CLOUDNOTES_TEST_DATABASE_URL` | _(unset)_ | Enables DB integration tests when set |
+
+## Database
+
+PostgreSQL with async SQLAlchemy 2.x and Alembic migrations — see **[docs/database.md](docs/database.md)** for the full guide (engine/session architecture, model conventions, migration workflow, readiness semantics, and test setup).
+
+Quick start for local development:
+
+```bash
+docker run -d --name cloudnotes-pg \
+  -e POSTGRES_USER=cloudnotes -e POSTGRES_PASSWORD=cloudnotes -e POSTGRES_DB=cloudnotes \
+  -p 5432:5432 postgres:16
+
+alembic upgrade head
+```
 
 ## Running tests
 
@@ -109,8 +140,19 @@ pytest
 The suite covers:
 
 - `GET /health` and `GET /api/v1/health` return `{"status": "ok", "version": ...}`
-- OpenAPI schema is served and lists both health routes
+- `GET /ready` verifies PostgreSQL connectivity (200) and reports 503 when the database is unreachable — unit-tested with a fake engine
+- OpenAPI schema is served and lists all operational routes
 - Settings can be overridden via constructor and via `CLOUDNOTES_*` environment variables
+
+Database integration tests (`tests/test_db.py`, marked `db`) run against real PostgreSQL and are **skipped unless `CLOUDNOTES_TEST_DATABASE_URL` is set**:
+
+```bash
+pytest                    # unit tests only (no database required)
+CLOUDNOTES_TEST_DATABASE_URL=postgresql+asyncpg://cloudnotes:cloudnotes@localhost:5432/cloudnotes_test pytest   # everything
+pytest -m db              # only database integration tests
+```
+
+See [docs/database.md](docs/database.md) for the full testing setup.
 
 ### Formatting and linting
 
@@ -124,6 +166,9 @@ ruff format .         # auto-format
 
 - **Application factory (`create_app`)** — `app/main.py` exposes both a `create_app()` factory and a module-level `app` for `uvicorn app.main:app`. The factory pattern keeps instantiation testable (fresh app per test) and lets future steps inject configuration.
 - **Versioned API namespace (`/api/v1`)** — all business endpoints will live under `app/api/v1/` and are assembled in `app/api/v1/__init__.py` into `api_v1_router`, mounted by the factory. Future versions add `app/api/v2/` without breaking v1 consumers.
+- **Async database access end to end** — asyncpg driver, async engine and sessions, `get_db` dependency; the engine lives in the application lifespan (attached to `app.state`, disposed on shutdown). Commits belong to the service layer, never to the `get_db` dependency.
+- **Migrations as code, credentials as env** — Alembic runs an async environment reading `CLOUDNOTES_DATABASE_URL`; nothing database-related is hardcoded in `alembic.ini`. Models use deterministic naming conventions so autogenerated migrations are stable, and `alembic check` guards against model/migration drift.
+- **Liveness vs readiness split** — `/health` never touches the database (safe for load-balancer probes); `/ready` executes `SELECT 1` and returns 503 with `database: false` when PostgreSQL is unusable.
 - **Health endpoint placement** — `/health` is registered at the root (for load balancers / container probes) and under `/api/v1/health` (showing the versioned surface). Both share one handler.
 - **Pydantic Settings with `CLOUDNOTES_` prefix** — explicit prefix prevents collisions with generic env vars; `.env` files are supported locally and never committed (`.env.example` documents all variables).
 - **Standard-library logging** — configured once via `configure_logging()` in a single format; keeps dependencies minimal. Structured/JSON logging can be layered on later without changing call sites.
@@ -132,8 +177,8 @@ ruff format .         # auto-format
 
 ## Roadmap
 
-- [ ] PostgreSQL + SQLAlchemy 2.x async engine/sessions
-- [ ] Alembic migrations
+- [x] PostgreSQL + SQLAlchemy 2.x async engine/sessions
+- [x] Alembic migrations
 - [ ] Notes & tags CRUD under `/api/v1`
 - [ ] Authentication & authorization
 - [ ] Docker & Docker Compose

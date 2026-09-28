@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
 
+    # Async SQLAlchemy URL, e.g. postgresql+asyncpg://user:password@host:5432/dbname
+    database_url: str = "postgresql+asyncpg://cloudnotes:cloudnotes@localhost:5432/cloudnotes"
+
+    @property
+    def database_url_offline(self) -> str:
+        """Driver-agnostic URL used by Alembic's offline SQL-rendering mode."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+
 
 @lru_cache
 def get_settings() -> Settings:

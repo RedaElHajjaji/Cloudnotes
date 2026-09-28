@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +28,16 @@ class Settings(BaseSettings):
 
     # Async SQLAlchemy URL, e.g. postgresql+asyncpg://user:password@host:5432/dbname
     database_url: str = "postgresql+asyncpg://cloudnotes:cloudnotes@localhost:5432/cloudnotes"
+
+    # --- Authentication / JWT ---
+    # Secret used to sign access tokens. REQUIRED: there is no default, so the
+    # application refuses to start without an explicitly configured secret.
+    jwt_secret: SecretStr
+    jwt_algorithm: str = "HS256"
+    # Access token lifetime in seconds (default: 30 minutes).
+    jwt_access_token_expire_seconds: int = 1800
+    # Issuer claim embedded in tokens and validated on decode.
+    jwt_issuer: str = "cloudnotes"
 
     @property
     def database_url_offline(self) -> str:

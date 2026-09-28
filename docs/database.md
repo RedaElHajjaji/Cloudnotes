@@ -47,7 +47,7 @@ router = APIRouter()
 async def list_things(db: AsyncSession = Depends(get_db)) -> dict[str, str]: ...
 ```
 
-The dependency always closes the session, even when a handler raises. **Commits belong to the service layer**, not to the dependency: `get_db` never commits implicitly.
+The dependency always closes the session, even when a handler raises. **Transaction-per-request:** `get_db` commits when the handler returns successfully and rolls back on any exception. Services flush (to obtain IDs and trigger constraint checks) but never commit themselves.
 
 ## Models
 

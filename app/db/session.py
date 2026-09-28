@@ -37,9 +37,15 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding a request-scoped database session.
 
-    The session (and its connection) is always closed, even if the request
-    handler raises; commits belong to the service layer, not to this
-    dependency.
+    Transaction-per-request: successful requests are committed when the
+    handler finishes; any exception rolls everything back. The session is
+    always closed. Services flush (to get IDs / trigger constraints) but do
+    not commit themselves.
     """
     async with AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

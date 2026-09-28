@@ -5,6 +5,11 @@ import os
 from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 
+# A test-only JWT secret must exist before any app module loads settings
+# (``app.main`` instantiates settings at import time and the secret is
+# intentionally required — see ``app/core/config.py``).
+os.environ.setdefault("CLOUDNOTES_JWT_SECRET", "unit-test-secret-do-not-use-in-production")
+
 import pytest
 from alembic import command
 from alembic.config import Config

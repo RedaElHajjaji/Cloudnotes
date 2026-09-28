@@ -15,6 +15,7 @@ CloudNotes provides a clean, layered FastAPI backend for managing notes and tags
 | Database | PostgreSQL 16+ |
 | ORM | SQLAlchemy 2.x (async, asyncpg driver) |
 | Migrations | Alembic (async environment) |
+| Auth | JWT access tokens (PyJWT) + Argon2id password hashing (argon2-cffi) |
 | Logging | Python `logging` (stdlib) |
 | Testing | pytest + pytest-asyncio + `fastapi.testclient` (httpx) |
 | Linting / formatting | Ruff (lint + format) |
@@ -32,18 +33,29 @@ cloudnotes/
 │   ├── api/
 │   │   └── v1/
 │   │       └── health.py    # GET /health
+│   ├── api/
+│   │   ├── deps.py          # get_db, get_auth_service, get_current_user (Bearer JWT)
+│   │   └── v1/
+│   │       ├── auth.py      # register / login / me
+│   │       ├── health.py    # GET /health
+│   │       └── ready.py     # GET /ready
 │   ├── core/
 │   │   ├── config.py        # Pydantic Settings (CLOUDNOTES_ env prefix)
-│   │   └── logging.py       # stdlib logging configuration
+│   │   ├── logging.py       # stdlib logging configuration
+│   │   └── security.py      # Argon2id hashing + JWT encode/decode
 │   ├── db/
 │   │   ├── base.py          # DeclarativeBase, naming conventions, TimestampMixin
 │   │   ├── session.py       # async engine, sessionmaker, get_db dependency
 │   │   └── health.py        # SELECT 1 connectivity probe
 │   ├── models/
 │   │   └── user.py          # User ORM model (users table)
-│   ├── schemas/             # Pydantic request/response schemas (future step)
-│   ├── services/            # business logic (future step)
-│   └── repositories/        # data access (future step)
+│   ├── schemas/             # Pydantic request/response schemas
+│   │   ├── user.py          # RegisterRequest, LoginRequest, TokenResponse, UserRead
+│   │   └── health.py        # ReadyResponse
+│   ├── services/
+│   │   └── auth.py          # AuthService: register / authenticate / issue token
+│   └── repositories/
+│       └── user.py          # UserRepository
 ├── docs/
 │   └── database.md          # database architecture & migrations guide
 ├── migrations/
@@ -53,6 +65,8 @@ cloudnotes/
 │   ├── conftest.py          # fixtures (TestClient, migrated DB engine, sessions)
 │   ├── test_health.py       # /health + OpenAPI docs tests
 │   ├── test_ready.py        # /ready unit tests (fake engine)
+│   ├── test_security.py     # hashing / JWT / password-policy unit tests
+│   ├── test_auth.py         # auth API tests (real PostgreSQL, gated)
 │   └── test_db.py           # DB integration tests (real PostgreSQL, gated)
 ├── .env.example             # template for local environment variables
 ├── .gitignore
@@ -115,7 +129,76 @@ All settings are loaded by Pydantic Settings (`app/core/config.py`) from environ
 | `CLOUDNOTES_LOG_LEVEL` | `INFO` | Root logging level |
 | `CLOUDNOTES_APP_NAME` | `CloudNotes` | Name shown in OpenAPI docs |
 | `CLOUDNOTES_DATABASE_URL` | `postgresql+asyncpg://cloudnotes:cloudnotes@localhost:5432/cloudnotes` | Async PostgreSQL URL (app + Alembic) |
+| `CLOUDNOTES_JWT_SECRET` | **(required — no default)** | Secret used to sign access tokens. Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `CLOUDNOTES_JWT_ALGORITHM` | `HS256` | Token signing algorithm |
+| `CLOUDNOTES_JWT_ACCESS_TOKEN_EXPIRE_SECONDS` | `1800` | Access token lifetime (30 minutes) |
+| `CLOUDNOTES_JWT_ISSUER` | `cloudnotes` | `iss` claim embedded in tokens and validated on decode |
 | `CLOUDNOTES_TEST_DATABASE_URL` | _(unset)_ | Enables DB integration tests when set |
+
+## Authentication
+
+CloudNotes uses **JWT bearer access tokens** with **Argon2id** password hashing.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/auth/register` | — | Create an account. Returns `201` with the public user. `409` if the email is taken; `422` for invalid email or weak password |
+| `POST` | `/api/v1/auth/login` | — | Exchange email + password for an access token. `401` on any failure (identical message for unknown email and wrong password — no user enumeration) |
+| `GET` | `/api/v1/auth/me` | Bearer token | Return the authenticated user. `401` when the token is missing, invalid, or expired |
+
+Password policy: minimum **10 characters**, at least one uppercase letter, one lowercase letter, and one digit. Passwords are stored **only** as Argon2id hashes; `password_hash` never appears in any API response.
+
+### Example requests
+
+```bash
+# 1. Register
+curl -X POST http://127.0.0.1:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "ada@example.com", "password": "Sup3r-Secret"}'
+# 201 {"id": "...", "email": "ada@example.com", "created_at": "...", "updated_at": "..."}
+
+# 2. Login (get a token)
+curl -X POST http://127.0.0.1:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "ada@example.com", "password": "Sup3r-Secret"}'
+# 200 {"access_token": "<jwt>", "token_type": "bearer"}
+
+# 3. Call a protected endpoint
+curl http://127.0.0.1:8000/api/v1/auth/me \
+  -H "Authorization: Bearer <access_token>"
+# 200 {"id": "...", "email": "ada@example.com", ...}
+```
+
+### Using the token in Swagger UI
+
+Open `/docs`, click **Authorize**, paste `Bearer <access_token>` (or just the token), and protected endpoints become callable from the UI.
+
+### Protecting your own endpoints
+
+Add the `CurrentUser` dependency — authentication is enforced automatically:
+
+```python
+from app.api.deps import CurrentUser
+
+
+@router.get("/notes")
+async def list_notes(current_user: CurrentUser) -> dict[str, str]:
+    return {"owner": current_user.email}
+```
+
+### How it fits together
+
+- **`app/core/security.py`** — Argon2id hashing (`hash_password`, `verify_password`, transparent rehash detection) and JWT creation/validation with typed errors. No FastAPI imports, unit-testable in isolation.
+- **`app/services/auth.py`** (`AuthService`) — business rules: duplicate-email detection (best-effort pre-check + unique index as the authoritative guard), constant-message login failures, timing-safe unknown-user path, parameter upgrades on login.
+- **`app/repositories/user.py`** — persistence; duplicate inserts surface as `IntegrityError` inside a savepoint so surrounding transactions survive.
+- **`app/api/deps.py`** — `get_current_user` parses the `Authorization: Bearer` header, validates the JWT (signature, expiry, issuer), and loads the user; `app.api.deps.CurrentUser` is the annotated dependency protected endpoints use.
+- **`app/api/v1/auth.py`** — routing only, mapping service errors to 201/409/401/422.
+- **Commits** — `get_db` uses transaction-per-request: successful requests commit when the handler returns; any exception rolls back.
+
+### Token details
+
+HS256-signed JWTs with `sub` (user id), `iat`, `exp`, `iss`, and a unique `jti`. All parameters are environment-configured (see table above). The app refuses to start without `CLOUDNOTES_JWT_SECRET` — there is deliberately no insecure default.
 
 ## Database
 
@@ -143,6 +226,9 @@ The suite covers:
 - `GET /ready` verifies PostgreSQL connectivity (200) and reports 503 when the database is unreachable — unit-tested with a fake engine
 - OpenAPI schema is served and lists all operational routes
 - Settings can be overridden via constructor and via `CLOUDNOTES_*` environment variables
+- Security primitives: Argon2id roundtrip, wrong-password and malformed-hash rejection, salt uniqueness, JWT claims, garbage/wrong-key/expired tokens, password policy
+
+Authentication API tests (`tests/test_auth.py`, marked `auth`) run the full stack against real PostgreSQL: registration, duplicate registration (409), weak password / invalid email (422), login, wrong password and unknown email (401 with identical bodies), missing/invalid/expired tokens on `/me` (401), successful `/me`, and verification that only Argon2id hashes are stored.
 
 Database integration tests (`tests/test_db.py`, marked `db`) run against real PostgreSQL and are **skipped unless `CLOUDNOTES_TEST_DATABASE_URL` is set**:
 
@@ -180,6 +266,6 @@ ruff format .         # auto-format
 - [x] PostgreSQL + SQLAlchemy 2.x async engine/sessions
 - [x] Alembic migrations
 - [ ] Notes & tags CRUD under `/api/v1`
-- [ ] Authentication & authorization
+- [x] Authentication (JWT + Argon2id; authorization/roles in a later step)
 - [ ] Docker & Docker Compose
 - [ ] GitHub Actions CI (lint + tests)
